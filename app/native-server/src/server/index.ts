@@ -22,7 +22,7 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { randomUUID } from 'node:crypto';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
-import { getMcpServer } from '../mcp/mcp-server';
+import { createMcpServer } from '../mcp/mcp-server';
 import { AgentStreamManager } from '../agent/stream-manager';
 import { AgentChatService } from '../agent/chat-service';
 import { CodexEngine } from '../agent/engines/codex';
@@ -42,12 +42,25 @@ interface ExtensionRequestPayload {
 // Server Class
 // ============================================================
 
+// Session idle timeout: 30 minutes
+const SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+// Cleanup sweep interval: every 5 minutes
+const SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+
+import { Server as McpServer } from '@modelcontextprotocol/sdk/server/index.js';
+
 export class Server {
   private fastify: FastifyInstance;
   public isRunning = false;
   private nativeHost: NativeMessagingHost | null = null;
   private transportsMap: Map<string, StreamableHTTPServerTransport | SSEServerTransport> =
     new Map();
+  // Per-session MCP Server instances
+  private mcpServersMap: Map<string, McpServer> = new Map();
+  // Track last activity time per session for idle timeout
+  private sessionLastActivity: Map<string, number> = new Map();
+  // Periodic cleanup timer
+  private cleanupTimer: ReturnType<typeof setInterval> | null = null;
   private agentStreamManager: AgentStreamManager;
   private agentChatService: AgentChatService;
 
@@ -175,14 +188,19 @@ export class Server {
         });
 
         const transport = new SSEServerTransport('/messages', reply.raw);
-        this.transportsMap.set(transport.sessionId, transport);
+        const sessionId = transport.sessionId;
+        this.transportsMap.set(sessionId, transport);
+        this.sessionLastActivity.set(sessionId, Date.now());
+
+        // Create a dedicated MCP Server for this SSE session
+        const mcpServer = createMcpServer();
+        this.mcpServersMap.set(sessionId, mcpServer);
 
         reply.raw.on('close', () => {
-          this.transportsMap.delete(transport.sessionId);
+          this.cleanupSession(sessionId);
         });
 
-        const server = getMcpServer();
-        await server.connect(transport);
+        await mcpServer.connect(transport);
 
         reply.raw.write(':\n\n');
       } catch (error) {
@@ -218,24 +236,33 @@ export class Server {
       ) as StreamableHTTPServerTransport;
 
       if (transport) {
-        // Transport found, proceed
+        // Transport found, update last activity
+        if (sessionId) {
+          this.sessionLastActivity.set(sessionId, Date.now());
+        }
       } else if (!sessionId && isInitializeRequest(request.body)) {
+        // New session: create a dedicated transport and MCP Server instance
         const newSessionId = randomUUID();
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => newSessionId,
           onsessioninitialized: (initializedSessionId) => {
             if (transport && initializedSessionId === newSessionId) {
               this.transportsMap.set(initializedSessionId, transport);
+              this.sessionLastActivity.set(initializedSessionId, Date.now());
             }
           },
         });
 
         transport.onclose = () => {
-          if (transport?.sessionId && this.transportsMap.get(transport.sessionId)) {
-            this.transportsMap.delete(transport.sessionId);
+          if (transport?.sessionId) {
+            this.cleanupSession(transport.sessionId);
           }
         };
-        await getMcpServer().connect(transport);
+
+        // Each session gets its own MCP Server instance
+        const mcpServer = createMcpServer();
+        this.mcpServersMap.set(newSessionId, mcpServer);
+        await mcpServer.connect(transport);
       } else {
         reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: ERROR_MESSAGES.INVALID_MCP_REQUEST });
         return;
@@ -285,7 +312,7 @@ export class Server {
       });
     });
 
-    // MCP DELETE endpoint
+    // MCP DELETE endpoint — client explicitly terminates session
     this.fastify.delete('/mcp', async (request, reply) => {
       const sessionId = request.headers['mcp-session-id'] as string | undefined;
       const transport = sessionId
@@ -299,6 +326,10 @@ export class Server {
 
       try {
         await transport.handleRequest(request.raw, reply.raw);
+        // Cleanup the session after DELETE is handled
+        if (sessionId) {
+          await this.cleanupSession(sessionId);
+        }
         if (!reply.sent) {
           reply.code(HTTP_STATUS.NO_CONTENT).send();
         }
@@ -310,6 +341,66 @@ export class Server {
         }
       }
     });
+  }
+
+  // ============================================================
+  // Server Lifecycle
+  // ============================================================
+
+  // ============================================================
+  // Session Cleanup
+  // ============================================================
+
+  /**
+   * Cleanup a single session: close MCP server, remove transport and activity tracking.
+   */
+  private async cleanupSession(sessionId: string): Promise<void> {
+    // Close the MCP Server instance for this session
+    const mcpServer = this.mcpServersMap.get(sessionId);
+    if (mcpServer) {
+      try {
+        await mcpServer.close();
+      } catch {
+        // Ignore close errors during cleanup
+      }
+      this.mcpServersMap.delete(sessionId);
+    }
+
+    // Remove transport and activity tracking
+    this.transportsMap.delete(sessionId);
+    this.sessionLastActivity.delete(sessionId);
+  }
+
+  /**
+   * Sweep and cleanup idle sessions that exceeded the timeout.
+   */
+  private async cleanupIdleSessions(): Promise<void> {
+    const now = Date.now();
+    const expiredSessions: string[] = [];
+
+    for (const [sessionId, lastActivity] of this.sessionLastActivity) {
+      if (now - lastActivity > SESSION_IDLE_TIMEOUT_MS) {
+        expiredSessions.push(sessionId);
+      }
+    }
+
+    for (const sessionId of expiredSessions) {
+      await this.cleanupSession(sessionId);
+    }
+
+    if (expiredSessions.length > 0) {
+      console.log(`[MCP] Cleaned up ${expiredSessions.length} idle session(s)`);
+    }
+  }
+
+  /**
+   * Cleanup all active sessions (used during server shutdown).
+   */
+  private async cleanupAllSessions(): Promise<void> {
+    const sessionIds = [...this.mcpServersMap.keys()];
+    for (const sessionId of sessionIds) {
+      await this.cleanupSession(sessionId);
+    }
   }
 
   // ============================================================
@@ -334,6 +425,13 @@ export class Server {
       process.env.CHROME_MCP_PORT = String(port);
       process.env.MCP_HTTP_PORT = String(port);
 
+      // Start periodic session cleanup timer
+      this.cleanupTimer = setInterval(() => {
+        this.cleanupIdleSessions().catch(() => {
+          // Ignore cleanup errors
+        });
+      }, SESSION_CLEANUP_INTERVAL_MS);
+
       this.isRunning = true;
     } catch (err) {
       this.isRunning = false;
@@ -347,11 +445,24 @@ export class Server {
     }
 
     try {
+      // Stop cleanup timer
+      if (this.cleanupTimer) {
+        clearInterval(this.cleanupTimer);
+        this.cleanupTimer = null;
+      }
+
+      // Cleanup all active sessions
+      await this.cleanupAllSessions();
+
       await this.fastify.close();
       closeDb();
       this.isRunning = false;
     } catch (err) {
       this.isRunning = false;
+      if (this.cleanupTimer) {
+        clearInterval(this.cleanupTimer);
+        this.cleanupTimer = null;
+      }
       closeDb();
       throw err;
     }
