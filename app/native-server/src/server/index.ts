@@ -268,18 +268,20 @@ export class Server {
         return;
       }
 
+      // Hijack the reply so Fastify hands over full control of the response
+      // to the SDK transport (which writes its own headers, status, and SSE stream).
+      reply.hijack();
+
       try {
         await transport.handleRequest(request.raw, reply.raw, request.body);
       } catch (error) {
-        if (!reply.sent) {
-          reply
-            .code(HTTP_STATUS.INTERNAL_SERVER_ERROR)
-            .send({ error: ERROR_MESSAGES.MCP_REQUEST_PROCESSING_ERROR });
+        if (!reply.raw.writableEnded) {
+          reply.raw.end();
         }
       }
     });
 
-    // MCP GET endpoint (SSE stream)
+    // MCP GET endpoint (standalone SSE stream for server-initiated messages)
     this.fastify.get('/mcp', async (request, reply) => {
       const sessionId = request.headers['mcp-session-id'] as string | undefined;
       const transport = sessionId
@@ -287,29 +289,27 @@ export class Server {
         : undefined;
 
       if (!transport) {
-        reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: ERROR_MESSAGES.INVALID_SSE_SESSION });
+        reply.code(HTTP_STATUS.BAD_REQUEST).send({
+          error: ERROR_MESSAGES.INVALID_SSE_SESSION,
+        });
         return;
       }
 
-      reply.raw.setHeader('Content-Type', 'text/event-stream');
-      reply.raw.setHeader('Cache-Control', 'no-cache');
-      reply.raw.setHeader('Connection', 'keep-alive');
-      reply.raw.flushHeaders();
+      // Update last activity timestamp for this session
+      this.sessionLastActivity.set(sessionId!, Date.now());
+
+      // IMPORTANT: Hijack the reply BEFORE passing to transport.
+      // This tells Fastify we're taking over the response completely,
+      // allowing the SDK transport to manage its own SSE headers and streaming.
+      reply.hijack();
 
       try {
-        await transport.handleRequest(request.raw, reply.raw);
-        if (!reply.sent) {
-          reply.hijack();
-        }
+        await transport.handleRequest(request.raw, reply.raw, request.body);
       } catch (error) {
         if (!reply.raw.writableEnded) {
           reply.raw.end();
         }
       }
-
-      request.socket.on('close', () => {
-        request.log.info(`SSE client disconnected for session: ${sessionId}`);
-      });
     });
 
     // MCP DELETE endpoint — client explicitly terminates session
@@ -324,20 +324,16 @@ export class Server {
         return;
       }
 
+      // Hijack before delegating to SDK transport
+      reply.hijack();
+
       try {
-        await transport.handleRequest(request.raw, reply.raw);
-        // Cleanup the session after DELETE is handled
-        if (sessionId) {
-          await this.cleanupSession(sessionId);
-        }
-        if (!reply.sent) {
-          reply.code(HTTP_STATUS.NO_CONTENT).send();
-        }
+        await transport.handleRequest(request.raw, reply.raw, request.body);
+        // Session cleanup happens via transport.onclose callback
+        // (set up during POST /mcp initialize), triggered by SDK's handleDeleteRequest
       } catch (error) {
-        if (!reply.sent) {
-          reply
-            .code(HTTP_STATUS.INTERNAL_SERVER_ERROR)
-            .send({ error: ERROR_MESSAGES.MCP_SESSION_DELETION_ERROR });
+        if (!reply.raw.writableEnded) {
+          reply.raw.end();
         }
       }
     });
